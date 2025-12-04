@@ -1,10 +1,12 @@
 """Config flow for Scrypted integration."""
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
+from aiohttp import ClientConnectorError, ClientError
 import voluptuous as vol
-from homeassistant import config_entries
+from homeassistant import config_entries, exceptions
 from homeassistant.const import (
     CONF_HOST,
     CONF_ICON,
@@ -16,7 +18,7 @@ from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.util import slugify
 
-from .const import DOMAIN, CONF_SCRYPTED_NVR
+from .const import CONF_SCRYPTED_NVR, DOMAIN
 from .http import retrieve_token
 
 
@@ -47,8 +49,9 @@ def _get_config_schema(default: dict[str, Any] | None) -> vol.Schema:
                 CONF_PASSWORD, default=default.get(CONF_PASSWORD)
             ): text_selector(type=selector.TextSelectorType.PASSWORD),
             vol.Optional(
-                CONF_SCRYPTED_NVR, default=False
-            ): bool,
+                CONF_SCRYPTED_NVR,
+                default=default.get(CONF_SCRYPTED_NVR, False),
+            ): selector.BooleanSelector(selector.BooleanSelectorConfig()),
         }
     )
 
@@ -62,18 +65,19 @@ class ScryptedConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Initialize flow."""
         self.data = {}
 
-    async def validate_input(self, data: dict[str, Any]) -> bool:
+    async def validate_input(self, data: dict[str, Any]) -> None:
         """Validate that the host is valid."""
         session = async_get_clientsession(self.hass, verify_ssl=False)
-        for key in (CONF_HOST, CONF_ICON, CONF_NAME, CONF_USERNAME):
-            if key not in data:
-                return False
         try:
             await retrieve_token(data, session)
-        except ValueError:
-            return False
-
-        return True
+        except ValueError as err:
+            raise InvalidAuth from err
+        except ClientConnectorError as err:
+            raise CannotConnect from err
+        except ClientError as err:
+            raise CannotConnect from err
+        except asyncio.TimeoutError as err:
+            raise CannotConnect from err
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -81,13 +85,20 @@ class ScryptedConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle user flow."""
         errors = {}
         if user_input is not None and CONF_USERNAME in user_input:
-            if await self.validate_input(user_input):
+            try:
+                await self.validate_input(user_input)
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except Exception:
+                errors["base"] = "unknown"
+            else:
                 await self.async_set_unique_id(slugify(user_input[CONF_HOST]))
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
                     title=user_input[CONF_HOST], data=user_input
                 )
-            errors["base"] = "invalid_host_or_credentials"
 
         return self.async_show_form(
             step_id="user",
@@ -111,7 +122,15 @@ class ScryptedConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle reauth step."""
         errors = {}
         if user_input is not None:
-            if await self.validate_input(user_input):
+            try:
+                await self.validate_input(user_input)
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except Exception:
+                errors["base"] = "unknown"
+            else:
                 unique_id = slugify(user_input[CONF_HOST])
                 config_entry = self.hass.config_entries.async_get_entry(
                     self.context["entry_id"]
@@ -132,12 +151,9 @@ class ScryptedConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
                 errors[CONF_NAME] = "already_configured"
 
-            if not errors:
-                errors["base"] = "invalid_host_or_credentials"
-
         return self.async_show_form(
             step_id=step_id,
-            data_schema=_get_config_schema(user_input or self.context["data"]),
+            data_schema=_get_config_schema(user_input or self.context.get("data")),
             errors=errors,
         )
 
@@ -152,3 +168,11 @@ class ScryptedConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.FlowResult:
         """Handle upgrade step."""
         return await self._async_step_reauth("upgrade", user_input)
+
+
+class CannotConnect(exceptions.HomeAssistantError):
+    """Error to indicate we cannot connect."""
+
+
+class InvalidAuth(exceptions.HomeAssistantError):
+    """Error to indicate there is invalid auth."""

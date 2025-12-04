@@ -1,4 +1,4 @@
-"""The Scrypted integration."""
+"""HTTP helpers for the Scrypted integration."""
 from __future__ import annotations
 
 import asyncio
@@ -6,22 +6,25 @@ import logging
 from collections.abc import Iterable
 from functools import lru_cache
 from ipaddress import ip_address
-import os
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
-import threading
 
 import aiohttp
-from aiohttp import ClientTimeout, hdrs, web
+from aiohttp import ClientResponseError, ClientTimeout, hdrs, web
 from aiohttp.web_exceptions import HTTPBadGateway, HTTPBadRequest
 from homeassistant.components.http import HomeAssistantView
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from multidict import CIMultiDict
 from yarl import URL
 
-from .const import DOMAIN, CONF_SCRYPTED_NVR
+from .const import (
+    DATA_ENTRY_RUNTIME,
+    DATA_TOKEN_LOOKUP,
+    DOMAIN,
+    ScryptedRuntimeData,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,13 +43,20 @@ async def retrieve_token(data: dict[str, Any], session: aiohttp.ClientSession) -
     else:
         port = "10443"
 
-    resp = await session.get(
-        f"https://{ip}:{port}/login",
-        headers={"authorization": aiohttp.BasicAuth(username, password).encode()},
-        json={"username": username},
-        raise_for_status=True,
-        verify_ssl=False,
-    )
+    try:
+        async with asyncio.timeout(10):
+            resp = await session.get(
+                f"https://{ip}:{port}/login",
+                headers={"authorization": aiohttp.BasicAuth(username, password).encode()},
+                json={"username": username},
+                raise_for_status=True,
+                ssl=False,
+            )
+    except ClientResponseError as err:
+        if err.status in (401, 403):
+            raise ValueError("Invalid credentials") from err
+        raise
+
     resp_json = await resp.json()
     if "token" not in resp_json:
         raise ValueError("No token in response")
@@ -65,24 +75,26 @@ class ScryptedView(HomeAssistantView):
         """Initialize a Hass.io ingress view."""
         self.hass = hass
         self._session = session
+        self._component_dir = Path(__file__).parent
         self.lit_core = asyncio.Future[str]()
         self.entrypoint_js = asyncio.Future[str]()
         self.entrypoint_html = asyncio.Future[str]()
-        hass.async_add_executor_job(lambda: self.load_files(session.loop))
+        hass.async_add_executor_job(self.load_files, hass.loop)
 
-    def load_files(self, loop: asyncio.AbstractEventLoop):
-        lit_core = str(open(os.path.join(os.path.dirname(__file__), "lit-core.min.js")).read())
-        entrypoint_js = str(open(os.path.join(os.path.dirname(__file__), "entrypoint.js")).read())
-        entrypoint_html = str(open(os.path.join(os.path.dirname(__file__), "entrypoint.html")).read())
-        loop.call_soon_threadsafe(lambda: self.lit_core.set_result(lit_core))
-        loop.call_soon_threadsafe(lambda: self.entrypoint_js.set_result(entrypoint_js))
-        loop.call_soon_threadsafe(lambda: self.entrypoint_html.set_result(entrypoint_html))
+    def load_files(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Load static frontend assets once in executor."""
+        lit_core = self._component_dir.joinpath("lit-core.min.js").read_text(encoding="utf-8")
+        entrypoint_js = self._component_dir.joinpath("entrypoint.js").read_text(encoding="utf-8")
+        entrypoint_html = self._component_dir.joinpath("entrypoint.html").read_text(encoding="utf-8")
+        loop.call_soon_threadsafe(self.lit_core.set_result, lit_core)
+        loop.call_soon_threadsafe(self.entrypoint_js.set_result, entrypoint_js)
+        loop.call_soon_threadsafe(self.entrypoint_html.set_result, entrypoint_html)
 
     @lru_cache
     def _create_url(self, token: str, path: str) -> str:
         """Create URL to service."""
-        entry: ConfigEntry = self.hass.data[DOMAIN][token]
-        host = entry.data[CONF_HOST]
+        runtime_data = self._get_runtime_data(token)
+        host = runtime_data.host
         ipport = host.split(":")
         if len(ipport) > 2:
             raise Exception("invalid Scrypted host")
@@ -92,16 +104,29 @@ class ScryptedView(HomeAssistantView):
         else:
             port = "10443"
 
-        base_path = "/"
-        url = f"https://{ip}:{port}/{quote(path)}"
+        sanitized_path = quote(path.lstrip("/"), safe="/?:&=#")
+        url = f"https://{ip}:{port}/{sanitized_path}"
 
         try:
-            if not URL(url).path.startswith(base_path):
-                raise HTTPBadRequest()
+            URL(url)
         except ValueError as err:
             raise HTTPBadRequest() from err
 
         return url
+
+    def _get_runtime_data(self, token: str) -> ScryptedRuntimeData:
+        """Return runtime data for a token."""
+        domain_data = self.hass.data.get(DOMAIN)
+        if not domain_data:
+            raise HTTPBadGateway()
+        token_lookup: dict[str, str] = domain_data.get(DATA_TOKEN_LOOKUP, {})
+        entry_id = token_lookup.get(token)
+        if not entry_id:
+            raise HTTPBadGateway()
+        entry_runtime: ScryptedRuntimeData | None = domain_data.get(DATA_ENTRY_RUNTIME, {}).get(entry_id)
+        if not entry_runtime:
+            raise HTTPBadGateway()
+        return entry_runtime
 
     async def _handle(
         self, request: web.Request, token: str, path: str
@@ -131,8 +156,8 @@ class ScryptedView(HomeAssistantView):
 
             if path == "entrypoint.html":
                 body = (await self.entrypoint_html).replace("__DOMAIN__", DOMAIN).replace("__TOKEN__", token)
-                entry: ConfigEntry = self.hass.data[DOMAIN][token]
-                if CONF_SCRYPTED_NVR in entry.data and entry.data[CONF_SCRYPTED_NVR]:
+                runtime_data = self._get_runtime_data(token)
+                if runtime_data.use_nvr_sidebar:
                     body = body.replace("core", "nvr")
 
                 response = web.Response(
@@ -193,7 +218,7 @@ class ScryptedView(HomeAssistantView):
         # Start proxy
         async with self._session.ws_connect(
             url,
-            verify_ssl=False,
+            ssl=False,
             headers=source_header,
             protocols=req_protocols,
             autoclose=False,
@@ -222,7 +247,7 @@ class ScryptedView(HomeAssistantView):
         async with self._session.request(
             request.method,
             url,
-            verify_ssl=False,
+            ssl=False,
             headers=source_header,
             params=request.query,
             allow_redirects=False,

@@ -1,31 +1,33 @@
 """The Scrypted integration."""
 from __future__ import annotations
 
+import asyncio
+
 from aiohttp import ClientConnectorError
-
-from typing import Any
-
 from homeassistant.components.frontend import (
     async_register_built_in_panel,
     async_remove_panel,
 )
 from homeassistant.components.persistent_notification import async_create
-from homeassistant.config_entries import SOURCE_IMPORT, SOURCE_REAUTH, ConfigEntry
-from homeassistant.const import CONF_ICON, CONF_NAME, Platform
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
+from homeassistant.const import CONF_HOST, CONF_ICON, CONF_NAME, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN
+from .const import (
+    CONF_SCRYPTED_NVR,
+    DATA_ENTRY_RUNTIME,
+    DATA_TOKEN_LOOKUP,
+    DOMAIN,
+    PANEL_RESOURCE_VERSION,
+    ScryptedRuntimeData,
+)
 from .http import ScryptedView, retrieve_token
 
-from homeassistant.components import panel_custom, websocket_api
 
-
-PLATFORMS = [
-    Platform.SENSOR
-]
+PLATFORMS = [Platform.SENSOR]
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Auth setup."""
@@ -52,73 +54,85 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Set up a Scrypted config entry."""
-
-    @callback
-    def _reauth(data: dict[str, Any]) -> bool:
-        """Start Reauth flow."""
-        hass.async_create_task(
-            hass.config_entries.flow.async_init(
-                DOMAIN,
-                context={
-                    "source": SOURCE_REAUTH,
-                    "entry_id": config_entry.entry_id,
-                    "data": dict(data),
-                },
-            )
-        )
-        return False
-
     if not config_entry.data:
-        return _reauth(config_entry.options)
+        raise ConfigEntryAuthFailed("Missing configuration data")
 
     session = async_get_clientsession(hass, verify_ssl=False)
     try:
-        if not (token := await retrieve_token(config_entry.data, session)):
-            return _reauth(config_entry.data)
-    except Exception as e:
-        if isinstance(e, ClientConnectorError):
-            raise ConfigEntryNotReady("ClientConnectorError. Is the Scrypted host down? Retrying.")
-        raise e
+        token = await retrieve_token(config_entry.data, session)
+    except ValueError as err:
+        raise ConfigEntryAuthFailed("Invalid Scrypted credentials") from err
+    except (ClientConnectorError, asyncio.TimeoutError) as err:
+        raise ConfigEntryNotReady("Unable to reach the Scrypted host") from err
 
-    hass.data.setdefault(DOMAIN, {})[token] = config_entry
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    entry_runtime: dict[str, ScryptedRuntimeData] = domain_data.setdefault(
+        DATA_ENTRY_RUNTIME, {}
+    )
+    token_lookup: dict[str, str] = domain_data.setdefault(DATA_TOKEN_LOOKUP, {})
 
-    custom_panel_config = {
-        "name": "ha-panel-scrypted",
-        # "embed_iframe": True,
-        "trust_external": False,
-        "module_url": f"/api/{DOMAIN}/{token}/entrypoint.js",
+    if stored_runtime := entry_runtime.get(config_entry.entry_id):
+        token_lookup.pop(stored_runtime.token, None)
+
+    panel_id = f"{DOMAIN}_{config_entry.entry_id}"
+    panel_config = {
+        "_panel_custom": {
+            "name": "ha-panel-scrypted",
+            "trust_external": False,
+            "module_url": f"/api/{DOMAIN}/{token}/entrypoint.js",
+        },
+        "version": PANEL_RESOURCE_VERSION,
     }
-
-    panelconf = {}
-    panelconf["_panel_custom"] = custom_panel_config
-    panelconf["version"] = "1.0.0"
 
     async_register_built_in_panel(
         hass,
         "custom",
-        config_entry.data[CONF_NAME],
-        config_entry.data[CONF_ICON],
-        f"{DOMAIN}_{token}",
-        panelconf,
+        config_entry.data.get(CONF_NAME, DOMAIN.title()),
+        config_entry.data.get(CONF_ICON),
+        panel_id,
+        panel_config,
         require_admin=False,
     )
 
-    # Set up token sensor
-    await hass.config_entries.async_forward_entry_setups(
-        config_entry, PLATFORMS
+    runtime_data = ScryptedRuntimeData(
+        token=token,
+        host=config_entry.data[CONF_HOST],
+        panel_id=panel_id,
+        use_nvr_sidebar=config_entry.data.get(CONF_SCRYPTED_NVR, False),
     )
+    entry_runtime[config_entry.entry_id] = runtime_data
+    token_lookup[token] = config_entry.entry_id
+
+    try:
+        await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+    except Exception:
+        await async_unload_entry(hass, config_entry)
+        raise
+
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    token = next(
-        token
-        for token, entry in hass.data[DOMAIN].items()
-        if entry.entry_id == config_entry.entry_id
+    domain_data = hass.data.get(DOMAIN)
+    unload_ok = await hass.config_entries.async_unload_platforms(
+        config_entry, PLATFORMS
     )
-    hass.data[DOMAIN].pop(token)
-    if not hass.data[DOMAIN]:
+
+    if not domain_data:
+        return unload_ok
+
+    entry_runtime: dict[str, ScryptedRuntimeData] = domain_data.get(
+        DATA_ENTRY_RUNTIME, {}
+    )
+    token_lookup: dict[str, str] = domain_data.get(DATA_TOKEN_LOOKUP, {})
+
+    runtime_data = entry_runtime.pop(config_entry.entry_id, None)
+    if runtime_data:
+        token_lookup.pop(runtime_data.token, None)
+        async_remove_panel(hass, runtime_data.panel_id)
+
+    if not entry_runtime:
         hass.data.pop(DOMAIN)
-    async_remove_panel(hass, f"{DOMAIN}_{config_entry.entry_id}")
-    return True
+
+    return unload_ok
