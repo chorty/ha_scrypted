@@ -12,13 +12,17 @@ import aiohttp
 from aiohttp import ClientTimeout, hdrs, web
 from aiohttp.web_exceptions import HTTPBadGateway, HTTPBadRequest
 from homeassistant.components.http import HomeAssistantView
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from multidict import CIMultiDict
 from yarl import URL
 
-from .const import DOMAIN, CONF_SCRYPTED_NVR
+from .const import (
+    DATA_ENTRY_RUNTIME,
+    DATA_TOKEN_LOOKUP,
+    DOMAIN,
+    ScryptedRuntimeData,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,8 +82,8 @@ class ScryptedView(HomeAssistantView):
     @lru_cache
     def _create_url(self, token: str, path: str) -> str:
         """Create URL to service."""
-        entry: ConfigEntry = self.hass.data[DOMAIN][token]
-        host = entry.data[CONF_HOST]
+        runtime = self._get_runtime_data(token)
+        host = runtime.host
         ipport = host.split(":")
         if len(ipport) > 2:
             raise Exception("invalid Scrypted host")
@@ -128,8 +132,8 @@ class ScryptedView(HomeAssistantView):
 
             if path == "entrypoint.html":
                 body = (await self.entrypoint_html).replace("__DOMAIN__", DOMAIN).replace("__TOKEN__", token)
-                entry: ConfigEntry = self.hass.data[DOMAIN][token]
-                if entry.options.get(CONF_SCRYPTED_NVR, entry.data.get(CONF_SCRYPTED_NVR, False)):
+                runtime = self._get_runtime_data(token)
+                if runtime.use_nvr_sidebar:
                     body = body.replace("core", "nvr")
 
                 response = web.Response(
@@ -215,6 +219,26 @@ class ScryptedView(HomeAssistantView):
         url = self._create_url(token, path)
         source_header = _init_header(request)
         source_header["Authorization"] = f"Bearer {token}"
+
+        def _get_runtime_data(self, token: str) -> ScryptedRuntimeData:
+            """Return runtime data for a token."""
+            domain_data = self.hass.data.get(DOMAIN)
+            if not domain_data:
+                raise HTTPBadGateway()
+
+            token_lookup: dict[str, str] = domain_data.get(DATA_TOKEN_LOOKUP, {})
+            entry_id = token_lookup.get(token)
+            if not entry_id:
+                raise HTTPBadGateway()
+
+            entry_runtime: dict[str, ScryptedRuntimeData] = domain_data.get(
+                DATA_ENTRY_RUNTIME, {}
+            )
+            runtime = entry_runtime.get(entry_id)
+            if not runtime:
+                raise HTTPBadGateway()
+
+            return runtime
 
         async with self._session.request(
             request.method,

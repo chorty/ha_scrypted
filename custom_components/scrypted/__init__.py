@@ -1,5 +1,7 @@
 """The Scrypted integration."""
 
+from __future__ import annotations
+
 import logging
 from typing import Any
 
@@ -19,13 +21,28 @@ from homeassistant.components.lovelace.resources import (
 )
 from homeassistant.components.persistent_notification import async_create
 from homeassistant.config_entries import SOURCE_IMPORT, SOURCE_REAUTH, ConfigEntry
-from homeassistant.const import CONF_ICON, CONF_ID, CONF_NAME, CONF_URL, Platform
+from homeassistant.const import (
+    CONF_HOST,
+    CONF_ICON,
+    CONF_ID,
+    CONF_NAME,
+    CONF_URL,
+    Platform,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
-from .const import CONF_AUTO_REGISTER_RESOURCES, CONF_SCRYPTED_NVR, DOMAIN
+from .const import (
+    CONF_AUTO_REGISTER_RESOURCES,
+    CONF_SCRYPTED_NVR,
+    DATA_ENTRY_RUNTIME,
+    DATA_TOKEN_LOOKUP,
+    DOMAIN,
+    PANEL_RESOURCE_VERSION,
+    ScryptedRuntimeData,
+)
 from .http import ScryptedView, retrieve_token
 
 PLATFORMS = [
@@ -239,7 +256,21 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
             raise ConfigEntryNotReady("ClientConnectorError. Is the Scrypted host down? Retrying.")
         raise e
 
-    hass.data.setdefault(DOMAIN, {})[token] = config_entry
+    entry_runtime, token_lookup = _async_get_runtime_maps(hass)
+    if stored_runtime := entry_runtime.get(config_entry.entry_id):
+        token_lookup.pop(stored_runtime.token, None)
+
+    panel_id = f"{DOMAIN}_{config_entry.entry_id}"
+    runtime_data = ScryptedRuntimeData(
+        token=token,
+        host=config_entry.data[CONF_HOST],
+        panel_id=panel_id,
+        use_nvr_sidebar=config_entry.options.get(
+            CONF_SCRYPTED_NVR, config_entry.data.get(CONF_SCRYPTED_NVR, False)
+        ),
+    )
+    entry_runtime[config_entry.entry_id] = runtime_data
+    token_lookup[token] = config_entry.entry_id
     config_entry.async_on_unload(
         config_entry.add_update_listener(_async_update_listener)
     )
@@ -254,42 +285,64 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
         "module_url": f"/api/{DOMAIN}/{token}/entrypoint.js",
     }
 
-    panelconf = {}
-    panelconf["_panel_custom"] = custom_panel_config
-    panelconf["version"] = "1.0.0"
+    panelconf = {
+        "_panel_custom": custom_panel_config,
+        "version": PANEL_RESOURCE_VERSION,
+    }
 
     async_register_built_in_panel(
         hass,
         "custom",
         sidebar_title=config_entry.data[CONF_NAME],
         sidebar_icon=config_entry.data[CONF_ICON],
-        frontend_url_path=f"{DOMAIN}_{token}",
+        frontend_url_path=panel_id,
         config=panelconf,
         require_admin=False,
     )
 
     # Set up token sensor
-    await hass.config_entries.async_forward_entry_setups(
-        config_entry, PLATFORMS
-    )
+    try:
+        await hass.config_entries.async_forward_entry_setups(
+            config_entry, PLATFORMS
+        )
+    except Exception:
+        await async_unload_entry(hass, config_entry)
+        raise
+
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    token = next(
-        token
-        for token, entry in hass.data[DOMAIN].items()
-        if entry.entry_id == config_entry.entry_id
+    entry_runtime = hass.data.get(DOMAIN, {}).get(DATA_ENTRY_RUNTIME, {})
+    runtime_data = entry_runtime.get(config_entry.entry_id)
+    token = runtime_data.token if runtime_data else None
+
+    await _async_unregister_lovelace_resource(
+        hass, token or "", config_entry.entry_id
     )
 
-    await _async_unregister_lovelace_resource(hass, token, config_entry.entry_id)
+    unload_ok = await hass.config_entries.async_unload_platforms(
+        config_entry, PLATFORMS
+    )
 
-    hass.data[DOMAIN].pop(token)
-    if not hass.data[DOMAIN]:
-        hass.data.pop(DOMAIN)
-    async_remove_panel(hass, f"{DOMAIN}_{config_entry.entry_id}")
-    return True
+    if domain_data := hass.data.get(DOMAIN):
+        entry_runtime = domain_data.get(DATA_ENTRY_RUNTIME, {})
+        token_lookup = domain_data.get(DATA_TOKEN_LOOKUP, {})
+        runtime_data = entry_runtime.pop(config_entry.entry_id, None)
+        if runtime_data:
+            token_lookup.pop(runtime_data.token, None)
+            panel_id = runtime_data.panel_id
+        else:
+            panel_id = f"{DOMAIN}_{config_entry.entry_id}"
+        async_remove_panel(hass, panel_id)
+
+        if not entry_runtime:
+            hass.data.pop(DOMAIN)
+    else:
+        async_remove_panel(hass, f"{DOMAIN}_{config_entry.entry_id}")
+
+    return unload_ok
 
 
 async def _async_update_listener(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
@@ -325,3 +378,18 @@ async def _async_ensure_entry_options(hass: HomeAssistant, config_entry: ConfigE
         )
 
     return changed
+
+
+def _async_get_runtime_maps(
+    hass: HomeAssistant,
+) -> tuple[dict[str, ScryptedRuntimeData], dict[str, str]]:
+    """Return the runtime/token lookup maps for the integration."""
+
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    entry_runtime: dict[str, ScryptedRuntimeData] = domain_data.setdefault(
+        DATA_ENTRY_RUNTIME, {}
+    )
+    token_lookup: dict[str, str] = domain_data.setdefault(
+        DATA_TOKEN_LOOKUP, {}
+    )
+    return entry_runtime, token_lookup
